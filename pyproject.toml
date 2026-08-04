@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "image-to-cad-self-engine"
+version = "0.1.0"
+description = "Single-file MVP for converting architectural scans/photos into CAD-style SVG/DXF/PDF/DOCX artifacts."
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "Unlicense"}
+authors = [{name = "IMAGE-TO-CAD contributors"}]
+dependencies = ["Pillow>=10.0"]
+
+[project.optional-dependencies]
+cv = ["numpy>=1.24", "opencv-python-headless>=4.8"]
+ocr = ["pytesseract>=0.3.10", "paddleocr>=2.7"]
+export = ["reportlab>=4.0", "python-docx>=1.1", "ezdxf>=1.1"]
+pdf = ["pdf2image>=1.16"]
+test = ["pytest>=8.0"]
+all = ["numpy>=1.24", "opencv-python-headless>=4.8", "pytesseract>=0.3.10", "reportlab>=4.0", "python-docx>=1.1", "ezdxf>=1.1", "pdf2image>=1.16", "pytest>=8.0"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+
+[tool.setuptools]
+py-modules = ["self_engine"]
