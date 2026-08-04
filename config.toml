@@ -1,0 +1,18 @@
+#:schema https://developers.openai.com/codex/config-schema.json
+
+# Codex runtime configuration for CAD-style reconstruction work.
+
+model = "gpt-5.4"
+review_model = "gpt-5.4"
+
+approval_policy = "on-request"
+sandbox_mode = "workspace-write"
+allow_login_shell = false
+
+# Let Codex load repository instructions automatically.
+project_doc_fallback_filenames = ["AGENTS.md", "README.md"]
+
+# Optional: keep telemetry enabled if your environment supports it.
+[otel]
+log_user_prompt = true
+environment = "dev"
