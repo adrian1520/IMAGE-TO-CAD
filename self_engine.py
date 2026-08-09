@@ -15,6 +15,7 @@ import json
 import math
 import shutil
 import sys
+import re
 import time
 from collections import defaultdict
 from dataclasses import asdict, dataclass, field
@@ -51,6 +52,10 @@ class EngineConfig:
     circle_min_radius: int = 8
     circle_max_radius: int = 240
     debug: bool = True
+    upscale_factor: int = 8
+    pdf_paper_size: str = "A4"
+    symbol_text_confidence_threshold: float = 0.82
+    symbol_text_crop_margin: int = 48
 
 
 @dataclass
@@ -104,6 +109,29 @@ class TextBlock:
     confidence: float
     font_size: float = 12.0
     font_family: str = "DejaVu Sans"
+
+
+@dataclass
+class OCRCandidate:
+    text: str
+    variant: str
+    confidence: float
+    normalized_text: str
+    pattern: Optional[str] = None
+    dictionary_match: bool = False
+    corrected: bool = False
+
+
+@dataclass
+class SymbolTextResult:
+    symbol_id: str
+    bbox: BBox
+    text_crop_bbox: BBox
+    ocr_candidates: List[OCRCandidate]
+    selected_text: Optional[str]
+    pattern: Optional[str]
+    qc_status: str
+    rejection_reason: Optional[str] = None
 
 
 @dataclass
@@ -453,6 +481,110 @@ class OCREngine:
         return blocks
 
 
+class SymbolTextEngine:
+    """Local OCR recovery for symbol labels using the original source as truth."""
+
+    PATTERNS = (r"^RG/F\d{2}$", r"^HC$", r"^HC Ø\d+$")
+    KNOWN_LABELS = {"RG/F06", "RG/F16", "RG/F19", "RG/F21", "RG/F22", "HC", "HC Ø20"}
+
+    def __init__(self, modules: OptionalModules, config: EngineConfig) -> None:
+        self.modules, self.config = modules, config
+
+    def recover(self, clean: CleanImage, geometry: GeometryResult, runtime_dir: Path) -> Tuple[List[SymbolTextResult], List[TextBlock], List[str]]:
+        symbols = [p for p in geometry.primitives if p.layer == "Symbols" or p.kind in {"circle", "symbol", "door", "window"}]
+        warnings: List[str] = []
+        if not symbols:
+            return [], [], warnings
+        image_mod = self.modules.load("PIL.Image")
+        if image_mod is None:
+            return [], [], ["Symbol OCR skipped because Pillow is unavailable."]
+        source_path = Path(clean.source_path if Path(clean.source_path).suffix.lower() != ".pdf" else clean.image_path)
+        source = image_mod.open(source_path).convert("RGB")
+        crop_dir = runtime_dir / "symbol_text_crops"
+        crop_dir.mkdir(parents=True, exist_ok=True)
+        results: List[SymbolTextResult] = []
+        overlay: List[TextBlock] = []
+        for index, symbol in enumerate(symbols[:200], 1):
+            crop_box = self._crop_bbox(symbol.bbox, source.width, source.height)
+            crop = source.crop(tuple(int(v) for v in crop_box))
+            variants = self._preprocess_variants(crop, image_mod)
+            candidates = self._ocr_variants(variants)
+            selected, status, reason = self._select_candidate(candidates)
+            symbol_id = f"SYM-{index:03d}"
+            for name, variant in variants.items():
+                variant.save(crop_dir / f"{symbol_id}_{name}.png")
+            result = SymbolTextResult(symbol_id, symbol.bbox, crop_box, candidates, selected.normalized_text if selected else None, selected.pattern if selected else None, status, reason)
+            results.append(result)
+            if selected and status in {"PASS", "CORRECTED"}:
+                overlay.append(TextBlock(selected.normalized_text, crop_box, selected.confidence))
+        return results, overlay, warnings
+
+    def _crop_bbox(self, bbox: BBox, width: int, height: int) -> BBox:
+        margin = max(0, int(self.config.symbol_text_crop_margin))
+        x1, y1, x2, y2 = bbox
+        return (max(0.0, x1 - margin), max(0.0, y1 - margin), min(float(width), x2 + margin * 2), min(float(height), y2 + margin))
+
+    def _preprocess_variants(self, crop: Any, image_mod: Any) -> Dict[str, Any]:
+        image_ops = self.modules.load("PIL.ImageOps")
+        gray = image_ops.grayscale(crop) if image_ops is not None else crop.convert("L")
+        contrast = image_ops.autocontrast(gray) if image_ops is not None else gray
+        threshold = contrast.point(lambda p: 255 if p > 160 else 0).convert("L")
+        resampling = getattr(image_mod, "Resampling", image_mod)
+        return {
+            "gray": gray,
+            "contrast": contrast,
+            "threshold": threshold,
+            "gray_x4": gray.resize((gray.width * 4, gray.height * 4), resampling.LANCZOS),
+            "gray_x8": gray.resize((gray.width * 8, gray.height * 8), resampling.LANCZOS),
+        }
+
+    def _ocr_variants(self, variants: Dict[str, Any]) -> List[OCRCandidate]:
+        pytesseract = self.modules.load("pytesseract")
+        if pytesseract is None or not shutil.which("tesseract"):
+            return []
+        candidates: List[OCRCandidate] = []
+        for variant, image in variants.items():
+            data = pytesseract.image_to_data(image, config="--psm 7", output_type=pytesseract.Output.DICT)
+            raw = " ".join(t.strip() for t in data.get("text", []) if t.strip())
+            confidences = []
+            for conf in data.get("conf", []):
+                value = str(conf)
+                if value.replace(".", "", 1).lstrip("-").isdigit() and float(value) >= 0:
+                    confidences.append(float(value) / 100.0)
+            if raw:
+                normalized, pattern, corrected = self.normalize_symbol_text(raw)
+                candidates.append(OCRCandidate(raw, variant, sum(confidences) / max(len(confidences), 1), normalized, pattern, normalized in self.KNOWN_LABELS, corrected))
+        return candidates
+
+    def normalize_symbol_text(self, text: str) -> Tuple[str, Optional[str], bool]:
+        original = text
+        value = re.sub(r"\s+", " ", text.strip().upper()).replace("RG-F", "RG/F").replace("RG F", "RG/F")
+        value = value.replace("RG/F I", "RG/F1").replace("RG/F L", "RG/F1")
+        rg = re.search(r"RG/F\s*([0-9OILSGl]{1,2})", value)
+        if rg:
+            digits = self._normalize_digits(rg.group(1)).zfill(2)[-2:]
+            value = f"RG/F{digits}"
+        hc = re.search(r"HC\s*(?:Ø|O|0)?\s*([0-9OILSGl]+)?", value)
+        if hc and value.startswith("HC"):
+            digits = self._normalize_digits(hc.group(1) or "")
+            value = f"HC Ø{digits}" if digits else "HC"
+        pattern = next((p for p in self.PATTERNS if re.match(p, value)), None)
+        return value, pattern, value != original.strip().upper()
+
+    def _normalize_digits(self, value: str) -> str:
+        return value.translate(str.maketrans({"O": "0", "I": "1", "L": "1", "l": "1", "S": "5", "G": "6"}))
+
+    def _select_candidate(self, candidates: List[OCRCandidate]) -> Tuple[Optional[OCRCandidate], str, Optional[str]]:
+        valid = [c for c in candidates if c.pattern and c.confidence >= self.config.symbol_text_confidence_threshold]
+        if not valid:
+            reason = "no_candidate_above_confidence_or_pattern_threshold" if candidates else "no_ocr_candidates"
+            return None, "MANUAL_REVIEW", reason
+        ranked = sorted(valid, key=lambda c: (1 if c.pattern else 0, c.confidence, 1 if c.dictionary_match else 0), reverse=True)
+        if len(ranked) > 1 and ranked[0].normalized_text != ranked[1].normalized_text and abs(ranked[0].confidence - ranked[1].confidence) < 0.03:
+            return None, "MANUAL_REVIEW", "ambiguous_top_candidates"
+        return ranked[0], "CORRECTED" if ranked[0].corrected else "PASS", None
+
+
 class FontEngine:
     def enrich(self, blocks: List[TextBlock]) -> List[TextBlock]:
         for block in blocks:
@@ -527,6 +659,16 @@ class Renderer:
         canvas.save(path)
         return out_w, out_h
 
+    def render_upscaled(self, path: Path, source_path: Path, factor: int = 8) -> Tuple[int, int]:
+        image_mod = self.modules.load("PIL.Image")
+        if image_mod is None:
+            raise RuntimeError("Pillow is required for x8 upscaling.")
+        source = image_mod.open(source_path).convert("RGB")
+        resampling = getattr(image_mod, "Resampling", image_mod)
+        size = (max(1, source.width * factor), max(1, source.height * factor))
+        source.resize(size, resampling.LANCZOS).save(path)
+        return size
+
     def render_debug_from_clean(self, path: Path, clean_path: str, overlay: List[GeometryPrimitive], junctions: Optional[List[Point]] = None) -> None:
         image_mod, image_draw = self.modules.load("PIL.Image"), self.modules.load("PIL.ImageDraw")
         image = image_mod.open(clean_path).convert("RGB")
@@ -541,15 +683,38 @@ class Renderer:
 
 
 class PDFExporter:
+    """A4 PDF exporter for final ChatGPT/Code Interpreter delivery."""
+
+    MM_PER_INCH = 25.4
+    PAPER_MM = {"A4": (210.0, 297.0), "A3": (297.0, 420.0), "LETTER": (215.9, 279.4)}
+
     def __init__(self, modules: OptionalModules) -> None:
         self.modules = modules
 
-    def export(self, path: Path, png_path: Path) -> Optional[str]:
+    def export(self, path: Path, png_path: Path, paper_size: str = "A4", dpi: int = 300) -> Optional[str]:
         image_mod = self.modules.load("PIL.Image")
-        if image_mod is not None:
-            image_mod.open(png_path).convert("RGB").save(path, "PDF", resolution=300.0)
-            return None
-        return "PDF export skipped because Pillow PDF is unavailable."
+        if image_mod is None:
+            return "PDF export skipped because Pillow PDF is unavailable."
+        page_w, page_h = self._paper_pixels(paper_size, dpi)
+        source = image_mod.open(png_path).convert("RGB")
+        fitted = self._fit_to_page(source, page_w, page_h, image_mod)
+        fitted.save(path, "PDF", resolution=float(dpi))
+        return None
+
+    def _paper_pixels(self, paper_size: str, dpi: int) -> Tuple[int, int]:
+        width_mm, height_mm = self.PAPER_MM.get(paper_size.upper(), self.PAPER_MM["A4"])
+        return int(round(width_mm / self.MM_PER_INCH * dpi)), int(round(height_mm / self.MM_PER_INCH * dpi))
+
+    def _fit_to_page(self, source: Any, page_w: int, page_h: int, image_mod: Any) -> Any:
+        margin = max(24, int(min(page_w, page_h) * 0.035))
+        available_w, available_h = page_w - 2 * margin, page_h - 2 * margin
+        scale = min(available_w / max(source.width, 1), available_h / max(source.height, 1))
+        out_w, out_h = max(1, int(source.width * scale)), max(1, int(source.height * scale))
+        resampling = getattr(image_mod, "Resampling", image_mod)
+        resized = source.resize((out_w, out_h), resampling.LANCZOS)
+        page = image_mod.new("RGB", (page_w, page_h), "white")
+        page.paste(resized, ((page_w - out_w) // 2, (page_h - out_h) // 2))
+        return page
 
 
 class DOCXExporter:
@@ -601,7 +766,7 @@ class SelfEngine:
     """Facade for cleaning, geometry, OCR, rendering, and export."""
 
     def __init__(self, config: Optional[EngineConfig] = None) -> None:
-        self.config = config or EngineConfig(); self.modules = OptionalModules(); self.cleaner = ImageCleaner(self.modules, self.config); self.geometry_engine = GeometryEngine(self.modules, self.config); self.ocr_engine = OCREngine(self.modules, self.config); self.font_engine = FontEngine(); self.renderer = Renderer(self.modules, self.config); self.svg_exporter = SVGExporter(); self.pdf_exporter = PDFExporter(self.modules); self.docx_exporter = DOCXExporter(self.modules); self.dxf_exporter = DXFExporter(self.modules); self.quality_engine = QualityEngine(); self._ocr_warnings: List[str] = []; self._render_warnings: List[str] = []
+        self.config = config or EngineConfig(); self.modules = OptionalModules(); self.cleaner = ImageCleaner(self.modules, self.config); self.geometry_engine = GeometryEngine(self.modules, self.config); self.ocr_engine = OCREngine(self.modules, self.config); self.symbol_text_engine = SymbolTextEngine(self.modules, self.config); self.font_engine = FontEngine(); self.renderer = Renderer(self.modules, self.config); self.svg_exporter = SVGExporter(); self.pdf_exporter = PDFExporter(self.modules); self.docx_exporter = DOCXExporter(self.modules); self.dxf_exporter = DXFExporter(self.modules); self.quality_engine = QualityEngine(); self._ocr_warnings: List[str] = []; self._render_warnings: List[str] = []
 
     def run(self, image: Optional[str] = None, image_path: Optional[str] = None, paper: Optional[str] = None, dpi: Optional[int] = None, output: Optional[Sequence[str]] = None) -> Dict[str, Any]:
         start = time.time(); source = image or image_path
@@ -611,12 +776,15 @@ class SelfEngine:
         if dpi: self.config.dpi = int(dpi)
         if output: self.config.output = tuple(output)
         runtime_dir = Path(self.config.runtime_dir); runtime_dir.mkdir(parents=True, exist_ok=True)
-        clean = self.clean_image(source); geometry = self.reconstruct_geometry(clean); text = self.font_engine.enrich(self.reconstruct_text(clean)); artifacts = self.render(geometry, text, clean)
-        geometry_json, text_json, report_json = runtime_dir / "geometry.json", runtime_dir / "text.json", runtime_dir / "report.json"
+        clean = self.clean_image(source); geometry = self.reconstruct_geometry(clean); text = self.font_engine.enrich(self.reconstruct_text(clean))
+        symbol_text, symbol_overlay, symbol_warnings = self.symbol_text_engine.recover(clean, geometry, runtime_dir)
+        text = self.font_engine.enrich(text + symbol_overlay); artifacts = self.render(geometry, text, clean)
+        geometry_json, text_json, symbol_text_json, report_json = runtime_dir / "geometry.json", runtime_dir / "text.json", runtime_dir / "symbol_text.json", runtime_dir / "report.json"
         geometry_json.write_text(json.dumps([asdict(p) for p in geometry.primitives], ensure_ascii=False, indent=2), encoding="utf-8")
         text_json.write_text(json.dumps([asdict(t) for t in text], ensure_ascii=False, indent=2), encoding="utf-8")
-        artifacts.update({"geometry": str(geometry_json), "text": str(text_json)})
-        warnings = clean.warnings + geometry.warnings + self._ocr_warnings + self._render_warnings
+        symbol_text_json.write_text(json.dumps([asdict(s) for s in symbol_text], ensure_ascii=False, indent=2), encoding="utf-8")
+        artifacts.update({"geometry": str(geometry_json), "text": str(text_json), "symbol_text": str(symbol_text_json)})
+        warnings = clean.warnings + geometry.warnings + self._ocr_warnings + symbol_warnings + self._render_warnings
         report_json.write_text(json.dumps(self.quality_engine.report(clean, geometry, text, warnings, time.time() - start, self.config), ensure_ascii=False, indent=2), encoding="utf-8")
         artifacts["report"] = str(report_json)
         return asdict(RenderResult(str(runtime_dir), artifacts, len(geometry.primitives), len(text), warnings))
@@ -639,8 +807,9 @@ class SelfEngine:
         if {"png", "pdf", "docx"} & requested:
             self.renderer.render_png(png_path, clean.width, clean.height, geometry.primitives, text, 8192); artifacts["png_8k"] = str(png_path)
             png16 = runtime_dir / "preview_16k.png"; self.renderer.render_png(png16, clean.width, clean.height, geometry.primitives, text, 16384); artifacts["png_16k"] = str(png16)
+            png_x8 = runtime_dir / "preview_x8.png"; self.renderer.render_upscaled(png_x8, Path(clean.image_path), max(1, int(self.config.upscale_factor))); artifacts["png_x8"] = str(png_x8)
         if "pdf" in requested:
-            path = runtime_dir / "drawing.pdf"; warning = self.pdf_exporter.export(path, png_path)
+            path = runtime_dir / "drawing.pdf"; warning = self.pdf_exporter.export(path, png_path, self.config.pdf_paper_size, 300)
             if warning: self._render_warnings.append(warning)
             if path.exists(): artifacts["pdf"] = str(path)
         if "docx" in requested:
