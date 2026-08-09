@@ -33,6 +33,18 @@ CLI:
 python self_engine.py /mnt/data/photo.jpg --paper A3 --dpi 1200 --output png svg pdf docx dxf
 ```
 
+
+## ChatGPT Projects / Custom GPT deployment
+
+For the final **Imager** workflow in ChatGPT Projects or a Custom GPT, use the flat-file bundle described in `CHATGPT_PROJECT_MANIFEST.md`. The production conversation flow is:
+
+1. inspect the uploaded photo, scan, or PDF,
+2. generate a clean 1:1 mini-CAD visual with native `@Stwórz Obraz` using `IMAGER_IMAGE_PROMPTS.md`,
+3. run `ada_upscale_a4_pdf.py` in Ada/Code Interpreter to create a deterministic x8 PNG and A4 PDF,
+4. optionally run `self_engine.py` when deterministic geometry artifacts such as SVG, DXF, JSON, and debug overlays are required.
+
+The bundle stays compatible with flat ChatGPT project storage: no nested folders are required for runtime use, and the required files are below the 20/25-file limits described in the deployment manifest.
+
 ## Runtime outputs
 
 By default artifacts are written to `/mnt/data/runtime`:
