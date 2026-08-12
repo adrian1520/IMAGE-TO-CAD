@@ -54,6 +54,10 @@ class EngineConfig:
     door_arc_min_radius: int = 12
     door_arc_max_radius: int = 120
     window_parallel_distance: float = 10.0
+    wall_thickness: float = 6.0
+    opening_min_width: float = 18.0
+    opening_max_width: float = 96.0
+    window_parallel_tolerance: float = 4.0
     circle_min_radius: int = 8
     circle_max_radius: int = 240
     debug: bool = True
@@ -95,6 +99,25 @@ class GeometryPrimitive:
     start_angle: Optional[float] = None
     end_angle: Optional[float] = None
     label: Optional[str] = None
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class CoordinateFrame:
+    origin: Point
+    x_axis: Point
+    y_axis: Point
+    unit: str = "px"
+    rotation_degrees: float = 0.0
+    scale: float = 1.0
+
+
+@dataclass
+class EndpointNode:
+    id: str
+    point: Point
+    degree: int
+    primitive_indices: List[int]
 
 
 @dataclass
@@ -104,6 +127,8 @@ class GeometryResult:
     junctions: List[Point]
     rooms: List[GeometryPrimitive]
     metrics: Dict[str, Any]
+    coordinate_frame: Optional[CoordinateFrame] = None
+    endpoint_graph: List[EndpointNode] = field(default_factory=list)
     warnings: List[str] = field(default_factory=list)
 
 
@@ -351,8 +376,8 @@ class SnapEngine:
         self.config = config
 
     def snap_and_merge(self, lines: List[GeometryPrimitive]) -> Tuple[List[GeometryPrimitive], Dict[str, int]]:
-        metrics = {"input_lines": len(lines), "snapped_vertices": 0, "merged_lines": 0, "removed_gaps": 0}
-        constrained = [self._constrain_angle(l) for l in lines if GeometryMath.length(l.points) >= self.config.min_line_length]
+        metrics = {"input_lines": len(lines), "snapped_vertices": 0, "merged_lines": 0, "removed_gaps": 0, "preserved_openings": 0}
+        constrained = [self._semantic_wall(self._constrain_angle(l)) for l in lines if GeometryMath.length(l.points) >= self.config.min_line_length]
         merged = self._merge_lines(constrained, metrics)
         metrics["output_lines"] = len(merged)
         return merged, metrics
@@ -366,7 +391,13 @@ class SnapEngine:
         length, rad = GeometryMath.length(line.points), math.radians(target)
         cx, cy = (p0[0] + p1[0]) / 2, (p0[1] + p1[1]) / 2
         pts = [(cx - math.cos(rad) * length / 2, cy - math.sin(rad) * length / 2), (cx + math.cos(rad) * length / 2, cy + math.sin(rad) * length / 2)]
-        return GeometryPrimitive("line", pts, GeometryMath.bbox(pts), line.layer, confidence=line.confidence)
+        return GeometryPrimitive("line", pts, GeometryMath.bbox(pts), line.layer, confidence=line.confidence, metadata=dict(line.metadata))
+
+    def _semantic_wall(self, line: GeometryPrimitive) -> GeometryPrimitive:
+        line.layer = "Walls"
+        line.stroke_width = max(line.stroke_width, self.config.wall_thickness)
+        line.metadata.setdefault("semantic", "wall_centerline")
+        return line
 
     def _merge_lines(self, lines: List[GeometryPrimitive], metrics: Dict[str, int]) -> List[GeometryPrimitive]:
         groups: Dict[Tuple[int, int], List[GeometryPrimitive]] = defaultdict(list)
@@ -386,6 +417,12 @@ class SnapEngine:
                     continue
                 c0, c1 = sorted([current.points[0][axis], current.points[-1][axis]])
                 l0, l1 = sorted([line.points[0][axis], line.points[-1][axis]])
+                gap = l0 - c1
+                if self.config.opening_min_width <= gap <= self.config.opening_max_width:
+                    metrics["preserved_openings"] += 1
+                    out.append(current)
+                    current = line
+                    continue
                 if l0 <= c1 + self.config.merge_distance:
                     pts = current.points + line.points
                     start, end = min(pts, key=lambda p: p[axis]), max(pts, key=lambda p: p[axis])
@@ -420,12 +457,63 @@ class GeometryEngine:
             warnings.append("OpenCV/NumPy not available; using projection-based fallback geometry.")
             raw, circles, arcs, windows = self._detect_lines_fallback(clean), [], [], []
         merged, metrics = self.snapper.snap_and_merge(raw)
+        frame = self._coordinate_frame(merged, clean)
+        endpoint_graph = self._endpoint_graph(merged)
+        openings = self._detect_openings(merged)
         junctions, rooms = self._compute_junctions(merged), self._recognize_rooms(merged)
         primitives = merged + rooms + circles + arcs + windows
         metrics.update({"line_count": len(merged), "junction_count": len(junctions), "room_count": len(rooms), "circle_count": len(circles), "door_arc_count": len(arcs), "window_count": len(windows)})
+        primitives = merged + openings + rooms + circles
+        metrics.update({"line_count": len(merged), "junction_count": len(junctions), "endpoint_node_count": len(endpoint_graph), "room_count": len(rooms), "circle_count": len(circles), "door_count": sum(1 for p in openings if p.kind == "door"), "window_count": sum(1 for p in openings if p.kind == "window")})
         if runtime_dir and self.config.debug:
-            (runtime_dir / "segments.json").write_text(json.dumps({"raw_segments": [asdict(p) for p in raw], "merged_segments": [asdict(p) for p in merged], "junctions": junctions}, indent=2), encoding="utf-8")
-        return GeometryResult(primitives, raw, junctions, rooms, metrics, warnings)
+            (runtime_dir / "segments.json").write_text(json.dumps({"coordinate_frame": asdict(frame), "raw_segments": [asdict(p) for p in raw], "merged_segments": [asdict(p) for p in merged], "endpoint_graph": [asdict(n) for n in endpoint_graph], "openings": [asdict(p) for p in openings], "junctions": junctions}, indent=2), encoding="utf-8")
+        return GeometryResult(primitives, raw, junctions, rooms, metrics, frame, endpoint_graph, warnings)
+
+
+    def _coordinate_frame(self, lines: List[GeometryPrimitive], clean: CleanImage) -> CoordinateFrame:
+        angles = [GeometryMath.angle(l.points) for l in lines if l.kind == "line"]
+        orthogonal = [a for a in angles if min(abs(a), abs(a - 90), abs(a - 180)) <= self.config.angle_tolerance_degrees]
+        rotation = 0.0 if len(orthogonal) >= max(1, len(angles) // 2) else (sum(angles) / max(len(angles), 1))
+        return CoordinateFrame((0.0, 0.0), (1.0, 0.0), (0.0, 1.0), "px", round(rotation, 4), 1.0)
+
+    def _endpoint_graph(self, lines: List[GeometryPrimitive]) -> List[EndpointNode]:
+        buckets: Dict[Tuple[int, int], List[Tuple[int, Point]]] = defaultdict(list)
+        snap = max(self.config.snap_distance, 1.0)
+        for index, line in enumerate(lines):
+            for point in (line.points[0], line.points[-1]):
+                buckets[(int(round(point[0] / snap)), int(round(point[1] / snap)))].append((index, point))
+        nodes: List[EndpointNode] = []
+        for node_index, items in enumerate(buckets.values(), 1):
+            x = sum(p[0] for _, p in items) / len(items); y = sum(p[1] for _, p in items) / len(items)
+            primitive_indices = sorted({i for i, _ in items})
+            nodes.append(EndpointNode(f"N-{node_index:04d}", (x, y), len(primitive_indices), primitive_indices))
+        return nodes
+
+    def _detect_openings(self, lines: List[GeometryPrimitive]) -> List[GeometryPrimitive]:
+        openings: List[GeometryPrimitive] = []
+        for axis in (0, 1):
+            groups: Dict[int, List[GeometryPrimitive]] = defaultdict(list)
+            for line in lines:
+                angle = GeometryMath.angle(line.points)
+                horizontal = abs(math.cos(math.radians(angle))) >= abs(math.sin(math.radians(angle)))
+                if (axis == 0) != horizontal:
+                    continue
+                fixed_axis = 1 - axis
+                fixed = (line.points[0][fixed_axis] + line.points[-1][fixed_axis]) / 2
+                groups[int(round(fixed / max(self.config.merge_distance, 1)))].append(line)
+            for group in groups.values():
+                ordered = sorted(group, key=lambda l: min(l.points[0][axis], l.points[-1][axis]))
+                for left, right in zip(ordered, ordered[1:]):
+                    l0, l1 = sorted([left.points[0][axis], left.points[-1][axis]])
+                    r0, r1 = sorted([right.points[0][axis], right.points[-1][axis]])
+                    gap = r0 - l1
+                    if self.config.opening_min_width <= gap <= self.config.opening_max_width:
+                        fixed = (left.points[-1][1 - axis] + right.points[0][1 - axis]) / 2
+                        pts = [(l1, fixed), (r0, fixed)] if axis == 0 else [(fixed, l1), (fixed, r0)]
+                        kind = "door" if gap >= (self.config.opening_min_width + self.config.opening_max_width) / 2 else "window"
+                        layer = "Doors" if kind == "door" else "Windows"
+                        openings.append(GeometryPrimitive(kind, pts, GeometryMath.bbox(pts), layer, stroke="#8a4b08" if kind == "door" else "#0070c0", stroke_width=max(2.0, self.config.wall_thickness / 2), confidence=0.62, label=f"{kind}_opening", metadata={"opening_width": gap}))
+        return openings[:500]
 
     def _detect_lines_cv(self, clean: CleanImage, cv2: Any) -> List[GeometryPrimitive]:
         img = cv2.imread(clean.threshold_path, cv2.IMREAD_GRAYSCALE)
@@ -566,7 +654,8 @@ class OCREngine:
 
     def _tesseract(self, clean: CleanImage, pytesseract: Any) -> List[TextBlock]:
         image_mod = self.modules.load("PIL.Image")
-        data = pytesseract.image_to_data(image_mod.open(clean.image_path), output_type=pytesseract.Output.DICT)
+        ocr_path = clean.source_path if Path(clean.source_path).suffix.lower() != ".pdf" else clean.image_path
+        data = pytesseract.image_to_data(image_mod.open(ocr_path), output_type=pytesseract.Output.DICT)
         blocks: List[TextBlock] = []
         for i, text in enumerate(data.get("text", [])):
             text = text.strip()
@@ -866,7 +955,8 @@ class DXFExporter:
 
 class QualityEngine:
     def report(self, clean: CleanImage, geometry: GeometryResult, text: List[TextBlock], warnings: List[str], elapsed: float, config: EngineConfig) -> Dict[str, Any]:
-        return {"source": clean.source_path, "clean_image": clean.image_path, "threshold_image": clean.threshold_path, "width": clean.width, "height": clean.height, "paper": config.paper, "dpi": config.dpi, "threshold": clean.threshold, "perspective_corrected": clean.perspective_corrected, "line_count": geometry.metrics.get("line_count", 0), "merged_lines": geometry.metrics.get("merged_lines", 0), "snapped_vertices": geometry.metrics.get("snapped_vertices", 0), "junction_count": geometry.metrics.get("junction_count", 0), "room_count": geometry.metrics.get("room_count", 0), "circle_count": geometry.metrics.get("circle_count", 0), "text_count": len(text), "ocr_confidence": round(sum(t.confidence for t in text) / max(len(text), 1), 4), "warnings": warnings, "processing_time_seconds": round(elapsed, 3), "assumptions": ["orthogonal walls are preserved unless detected angle exceeds tolerance", "OCR output is not used to infer geometry"], "failure_modes": ["low contrast scans may under-detect lines", "PDF support requires pdf2image/poppler"], "metrics": geometry.metrics}
+        frame = asdict(geometry.coordinate_frame) if geometry.coordinate_frame else None
+        return {"mvp_version": "0.2", "source": clean.source_path, "clean_image": clean.image_path, "threshold_image": clean.threshold_path, "width": clean.width, "height": clean.height, "paper": config.paper, "dpi": config.dpi, "threshold": clean.threshold, "perspective_corrected": clean.perspective_corrected, "line_count": geometry.metrics.get("line_count", 0), "merged_lines": geometry.metrics.get("merged_lines", 0), "snapped_vertices": geometry.metrics.get("snapped_vertices", 0), "junction_count": geometry.metrics.get("junction_count", 0), "room_count": geometry.metrics.get("room_count", 0), "circle_count": geometry.metrics.get("circle_count", 0), "door_count": geometry.metrics.get("door_count", 0), "window_count": geometry.metrics.get("window_count", 0), "endpoint_node_count": geometry.metrics.get("endpoint_node_count", 0), "coordinate_frame": frame, "text_count": len(text), "ocr_confidence": round(sum(t.confidence for t in text) / max(len(text), 1), 4), "warnings": warnings, "processing_time_seconds": round(elapsed, 3), "assumptions": ["orthogonal walls are preserved unless detected angle exceeds tolerance", "OCR output is not used to infer geometry"], "failure_modes": ["low contrast scans may under-detect lines", "PDF support requires pdf2image/poppler"], "metrics": geometry.metrics}
 
 
 class SelfEngine:
@@ -936,7 +1026,9 @@ class SelfEngine:
         self.renderer.render_debug_from_clean(lines_path, clean.image_path, geometry.raw_segments)
         self.renderer.render_debug_from_clean(junctions_path, clean.image_path, geometry.primitives, geometry.junctions)
         self.renderer.render_debug_from_clean(snap_path, clean.image_path, [p for p in geometry.primitives if p.kind == "line"])
-        artifacts.update({"debug_lines": str(lines_path), "debug_junctions": str(junctions_path), "debug_snap": str(snap_path), "threshold": clean.threshold_path, "segments": str(runtime_dir / "segments.json")})
+        overlay_qc = runtime_dir / "overlay_qc.png"
+        self.renderer.render_debug_from_clean(overlay_qc, clean.source_path if Path(clean.source_path).suffix.lower() != ".pdf" else clean.image_path, geometry.primitives, geometry.junctions)
+        artifacts.update({"debug_lines": str(lines_path), "debug_junctions": str(junctions_path), "debug_snap": str(snap_path), "overlay_qc": str(overlay_qc), "threshold": clean.threshold_path, "segments": str(runtime_dir / "segments.json")})
 
 
 Engine = SelfEngine

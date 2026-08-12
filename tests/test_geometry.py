@@ -66,3 +66,41 @@ def test_geometry_engine_detects_parallel_window_semantic_primitive():
     assert len(windows) == 1
     assert windows[0].kind == "window"
     assert windows[0].layer == "Windows"
+def test_mvp_02_preserves_opening_gap_and_builds_endpoint_graph():
+    from self_engine import EngineConfig, GeometryPrimitive, SnapEngine
+
+    config = EngineConfig(merge_distance=8, min_line_length=5, opening_min_width=20, opening_max_width=60)
+    lines = [
+        GeometryPrimitive("line", [(0, 0), (50, 0)], (0, 0, 50, 0), "Walls"),
+        GeometryPrimitive("line", [(80, 0), (130, 0)], (80, 0, 130, 0), "Walls"),
+    ]
+
+    merged, metrics = SnapEngine(config).snap_and_merge(lines)
+
+    assert len(merged) == 2
+    assert metrics["preserved_openings"] == 1
+    assert all(line.metadata["semantic"] == "wall_centerline" for line in merged)
+
+
+def test_mvp_02_detects_openings_coordinate_frame_and_report(tmp_path):
+    from self_engine import CleanImage, EngineConfig, GeometryEngine, GeometryPrimitive, OptionalModules, QualityEngine
+
+    config = EngineConfig(runtime_dir=str(tmp_path), debug=True, opening_min_width=20, opening_max_width=60, merge_distance=8)
+    engine = GeometryEngine(OptionalModules(), config)
+    lines = [
+        GeometryPrimitive("line", [(0, 0), (50, 0)], (0, 0, 50, 0), "Walls"),
+        GeometryPrimitive("line", [(80, 0), (130, 0)], (80, 0, 130, 0), "Walls"),
+    ]
+    openings = engine._detect_openings(lines)
+    graph = engine._endpoint_graph(lines)
+    clean = CleanImage("source.png", "clean.png", "threshold.png", 140, 80, "RGB", 128)
+    assert len(openings) == 1
+    assert openings[0].kind == "window"
+    assert len(graph) == 4
+
+    from self_engine import GeometryResult
+    result = GeometryResult(lines + openings, lines, [], [], {"door_count": 0, "window_count": 1, "endpoint_node_count": 4}, engine._coordinate_frame(lines, clean), graph)
+    report = QualityEngine().report(clean, result, [], [], 0.1, config)
+    assert report["mvp_version"] == "0.2"
+    assert report["coordinate_frame"]["unit"] == "px"
+    assert report["window_count"] == 1
