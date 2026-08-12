@@ -49,6 +49,11 @@ class EngineConfig:
     merge_distance: float = 8.0
     min_line_length: float = 14.0
     room_close_tolerance: float = 12.0
+    photo_shadow_kernel_ratio: float = 0.035
+    fold_line_suppression_width: int = 9
+    door_arc_min_radius: int = 12
+    door_arc_max_radius: int = 120
+    window_parallel_distance: float = 10.0
     circle_min_radius: int = 8
     circle_max_radius: int = 240
     debug: bool = True
@@ -253,16 +258,62 @@ class ImageCleaner:
         arr = np.array(pil)
         corrected_arr, corrected = self._perspective_correct(arr, cv2, np, warnings)
         gray = cv2.cvtColor(corrected_arr, cv2.COLOR_RGB2GRAY)
+        gray = self._normalize_photo_background(gray, cv2, np, warnings)
         gray = cv2.fastNlMeansDenoising(gray, None, 7, 7, 21)
         enhanced = cv2.createCLAHE(clipLimit=self.config.clahe_clip_limit, tileGridSize=(8, 8)).apply(gray)
         block = self.config.adaptive_block_size + (1 - self.config.adaptive_block_size % 2)
         binary = cv2.adaptiveThreshold(enhanced, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, block, self.config.adaptive_c)
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (max(1, self.config.morphology_kernel), max(1, self.config.morphology_kernel)))
         binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=1)
+        binary = self._suppress_fold_shadows(binary, cv2, np, warnings)
         binary = self._deskew(binary, cv2, np, warnings)
         threshold = int(cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[0])
         out = image_mod.fromarray(binary).convert("RGB")
         return out, out, threshold, corrected
+
+    def _normalize_photo_background(self, gray: Any, cv2: Any, np: Any, warnings: List[str]) -> Any:
+        """Flatten uneven illumination from photographed or folded plans.
+
+        The reference inputs have broad gray bands and paper gradients. A large
+        morphological background estimate removes those low-frequency shadows
+        before thresholding while preserving thin ink strokes for later semantic
+        geometry reconstruction.
+        """
+        h, w = gray.shape[:2]
+        kernel_size = max(15, int(min(h, w) * self.config.photo_shadow_kernel_ratio) | 1)
+        background = cv2.medianBlur(gray, kernel_size)
+        flattened = cv2.divide(gray, background, scale=255)
+        if float(np.std(background)) > 6.0:
+            warnings.append("Normalized uneven photo/scan illumination before thresholding.")
+        return flattened
+
+    def _suppress_fold_shadows(self, binary: Any, cv2: Any, np: Any, warnings: List[str]) -> Any:
+        """Remove page-fold bands that cross rooms but are not CAD geometry."""
+        black = binary < 128
+        h, w = black.shape[:2]
+        row_density = black.mean(axis=1)
+        candidates = np.where((row_density > 0.02) & (row_density < 0.35))[0]
+        if candidates.size == 0:
+            return binary
+        runs: List[Tuple[int, int]] = []
+        start = int(candidates[0])
+        prev = start
+        for y in candidates[1:]:
+            y = int(y)
+            if y == prev + 1:
+                prev = y
+            else:
+                runs.append((start, prev)); start = prev = y
+        runs.append((start, prev))
+        out = binary.copy()
+        removed = 0
+        for y0, y1 in runs:
+            if y1 - y0 <= self.config.fold_line_suppression_width and w * 0.25 <= black[y0:y1 + 1].sum() <= w * max(1, y1 - y0 + 1) * 0.35:
+                out[max(0, y0 - 1):min(h, y1 + 2), :] = 255
+                removed += 1
+        if removed:
+            warnings.append(f"Suppressed {removed} likely fold/shadow band(s) after thresholding.")
+        return out
 
     def _perspective_correct(self, arr: Any, cv2: Any, np: Any, warnings: List[str]) -> Tuple[Any, bool]:
         gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
@@ -363,13 +414,15 @@ class GeometryEngine:
         warnings: List[str] = []
         if cv2 is not None and np is not None:
             raw, circles = self._detect_lines_cv(clean, cv2), self._detect_circles_cv(clean, cv2, np)
+            arcs = self._detect_door_arcs_cv(clean, cv2, np)
+            windows = self._detect_windows(raw)
         else:
             warnings.append("OpenCV/NumPy not available; using projection-based fallback geometry.")
-            raw, circles = self._detect_lines_fallback(clean), []
+            raw, circles, arcs, windows = self._detect_lines_fallback(clean), [], [], []
         merged, metrics = self.snapper.snap_and_merge(raw)
         junctions, rooms = self._compute_junctions(merged), self._recognize_rooms(merged)
-        primitives = merged + rooms + circles
-        metrics.update({"line_count": len(merged), "junction_count": len(junctions), "room_count": len(rooms), "circle_count": len(circles)})
+        primitives = merged + rooms + circles + arcs + windows
+        metrics.update({"line_count": len(merged), "junction_count": len(junctions), "room_count": len(rooms), "circle_count": len(circles), "door_arc_count": len(arcs), "window_count": len(windows)})
         if runtime_dir and self.config.debug:
             (runtime_dir / "segments.json").write_text(json.dumps({"raw_segments": [asdict(p) for p in raw], "merged_segments": [asdict(p) for p in merged], "junctions": junctions}, indent=2), encoding="utf-8")
         return GeometryResult(primitives, raw, junctions, rooms, metrics, warnings)
@@ -411,6 +464,50 @@ class GeometryEngine:
         img = cv2.imread(clean.threshold_path, cv2.IMREAD_GRAYSCALE)
         circles = cv2.HoughCircles(img, cv2.HOUGH_GRADIENT, dp=1.2, minDist=24, param1=80, param2=24, minRadius=self.config.circle_min_radius, maxRadius=self.config.circle_max_radius)
         return [GeometryPrimitive("circle", [], (float(x-r), float(y-r), float(x+r), float(y+r)), "Symbols", confidence=0.75, radius=float(r), center=(float(x), float(y))) for x, y, r in np.round(circles[0, :]).astype("int")] if circles is not None else []
+
+    def _detect_door_arcs_cv(self, clean: CleanImage, cv2: Any, np: Any) -> List[GeometryPrimitive]:
+        img = cv2.imread(clean.threshold_path, cv2.IMREAD_GRAYSCALE)
+        edges = cv2.Canny(255 - img, 50, 150)
+        contours, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
+        arcs: List[GeometryPrimitive] = []
+        for contour in contours:
+            if len(contour) < 12:
+                continue
+            pts = contour.reshape(-1, 2).astype("float32")
+            (x, y), radius = cv2.minEnclosingCircle(pts)
+            if not (self.config.door_arc_min_radius <= radius <= self.config.door_arc_max_radius):
+                continue
+            perimeter = cv2.arcLength(contour, False)
+            coverage = perimeter / max(2 * math.pi * radius, 1.0)
+            if 0.14 <= coverage <= 0.42:
+                angles = [math.degrees(math.atan2(float(py - y), float(px - x))) % 360 for px, py in pts[::max(1, len(pts)//24)]]
+                start, end = min(angles), max(angles)
+                bbox = (float(x - radius), float(y - radius), float(x + radius), float(y + radius))
+                arcs.append(GeometryPrimitive("door", [], bbox, "Doors", stroke="#8a4b08", confidence=0.62, radius=float(radius), center=(float(x), float(y)), start_angle=start, end_angle=end, label="swing_arc"))
+        return arcs[:120]
+
+    def _detect_windows(self, lines: List[GeometryPrimitive]) -> List[GeometryPrimitive]:
+        windows: List[GeometryPrimitive] = []
+        for i, a in enumerate(lines):
+            aa = GeometryMath.angle(a.points)
+            if min(aa, abs(aa - 90), abs(aa - 180)) > self.config.angle_tolerance_degrees:
+                continue
+            for b in lines[i + 1:]:
+                if abs(GeometryMath.length(a.points) - GeometryMath.length(b.points)) > max(8.0, GeometryMath.length(a.points) * 0.25):
+                    continue
+                ba = GeometryMath.angle(b.points)
+                if min(abs(aa - ba), 180 - abs(aa - ba)) > self.config.angle_tolerance_degrees:
+                    continue
+                if aa < 45 or aa > 135:
+                    distance = abs(((a.points[0][1] + a.points[-1][1]) - (b.points[0][1] + b.points[-1][1])) / 2)
+                    overlap = min(a.bbox[2], b.bbox[2]) - max(a.bbox[0], b.bbox[0])
+                else:
+                    distance = abs(((a.points[0][0] + a.points[-1][0]) - (b.points[0][0] + b.points[-1][0])) / 2)
+                    overlap = min(a.bbox[3], b.bbox[3]) - max(a.bbox[1], b.bbox[1])
+                if 2.0 <= distance <= self.config.window_parallel_distance and overlap >= self.config.min_line_length:
+                    bbox = (min(a.bbox[0], b.bbox[0]), min(a.bbox[1], b.bbox[1]), max(a.bbox[2], b.bbox[2]), max(a.bbox[3], b.bbox[3]))
+                    windows.append(GeometryPrimitive("window", [(bbox[0], bbox[1]), (bbox[2], bbox[3])], bbox, "Windows", stroke="#0070c0", confidence=0.58, label="parallel_pair"))
+        return windows[:120]
 
     def _compute_junctions(self, lines: List[GeometryPrimitive]) -> List[Point]:
         points: List[Point] = []
@@ -619,6 +716,11 @@ class SVGExporter:
         if p.kind in {"line", "door", "window"} and len(p.points) >= 2:
             a, b = p.points[0], p.points[-1]
             return f'<line x1="{a[0]:.2f}" y1="{a[1]:.2f}" x2="{b[0]:.2f}" y2="{b[1]:.2f}" stroke="{p.stroke}" stroke-width="{p.stroke_width:.2f}"/>'
+        if p.kind == "door" and p.center and p.radius and p.start_angle is not None and p.end_angle is not None:
+            start = (p.center[0] + math.cos(math.radians(p.start_angle)) * p.radius, p.center[1] + math.sin(math.radians(p.start_angle)) * p.radius)
+            end = (p.center[0] + math.cos(math.radians(p.end_angle)) * p.radius, p.center[1] + math.sin(math.radians(p.end_angle)) * p.radius)
+            large = 1 if abs(p.end_angle - p.start_angle) > 180 else 0
+            return f'<path d="M {start[0]:.2f} {start[1]:.2f} A {p.radius:.2f} {p.radius:.2f} 0 {large} 1 {end[0]:.2f} {end[1]:.2f}" stroke="{p.stroke}" stroke-width="{p.stroke_width:.2f}" fill="none"/>'
         if p.kind in {"circle", "symbol"} and p.center and p.radius:
             return f'<circle cx="{p.center[0]:.2f}" cy="{p.center[1]:.2f}" r="{p.radius:.2f}" stroke="{p.stroke}" stroke-width="{p.stroke_width:.2f}"/>'
         if p.points:
@@ -644,7 +746,10 @@ class Renderer:
         colors = {"Walls": "black", "Doors": "#8a4b08", "Windows": "#0070c0", "Symbols": "#555555", "Debug": "#00aa00"}
         for p in geometry:
             color = colors.get(p.layer, "black")
-            if len(p.points) >= 2:
+            if p.kind == "door" and p.center and p.radius and p.start_angle is not None and p.end_angle is not None:
+                bbox = ((p.center[0]-p.radius)*scale, (p.center[1]-p.radius)*scale, (p.center[0]+p.radius)*scale, (p.center[1]+p.radius)*scale)
+                draw.arc(bbox, start=p.start_angle, end=p.end_angle, fill=color, width=max(1, int(p.stroke_width * scale)))
+            elif len(p.points) >= 2:
                 pts = [(x * scale, y * scale) for x, y in p.points]
                 draw.line(pts + ([pts[0]] if p.kind == "room" else []), fill=color, width=max(1, int(p.stroke_width * scale)))
             elif p.center and p.radius:
@@ -749,6 +854,8 @@ class DXFExporter:
                 lines += ["0", "LWPOLYLINE", "8", p.layer, "90", str(len(p.points)), "70", "1"]
                 for x, y in p.points:
                     lines += ["10", f"{x:.3f}", "20", f"{-y:.3f}"]
+            elif p.kind == "door" and p.center and p.radius and p.start_angle is not None and p.end_angle is not None:
+                lines += ["0", "ARC", "8", p.layer, "10", f"{p.center[0]:.3f}", "20", f"{-p.center[1]:.3f}", "40", f"{p.radius:.3f}", "50", f"{-p.end_angle:.3f}", "51", f"{-p.start_angle:.3f}"]
             elif p.kind in {"circle", "symbol"} and p.center and p.radius:
                 lines += ["0", "CIRCLE", "8", p.layer, "10", f"{p.center[0]:.3f}", "20", f"{-p.center[1]:.3f}", "40", f"{p.radius:.3f}"]
         for block in text:
