@@ -19,7 +19,7 @@ def test_pipeline_end_to_end_generates_core_artifacts(tmp_path):
     engine = SelfEngine(EngineConfig(runtime_dir=str(runtime), output=("png", "svg", "dxf"), debug=True, render_max_pixels=8_000_000, hough_min_line_length=20))
     result = engine.run(image=str(image_path), paper="A3", dpi=1200)
     artifacts = result["artifacts"]
-    for key in ["svg", "dxf", "png_8k", "png_x8", "geometry", "text", "symbol_text", "report", "threshold", "segments"]:
+    for key in ["svg", "dxf", "png_8k", "png_x8", "geometry", "text", "symbol_text", "report", "threshold", "segments", "overlay_qc"]:
         assert key in artifacts
     for value in artifacts.values():
         assert (runtime / value.split("/")[-1]).exists() or value
